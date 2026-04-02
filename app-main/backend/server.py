@@ -10,6 +10,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import os
 import logging
+import certifi
 from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from typing import List, Optional, Dict, Any
 import uuid
@@ -21,6 +22,8 @@ import aiosqlite
 import asyncio
 import json
 import subprocess
+import sys
+import tempfile
 
 # OpenAI Integration
 from openai import AsyncOpenAI
@@ -30,10 +33,31 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 ROOT_DIR = Path(__file__).parent
+TEMP_TEST_DIR = Path(tempfile.gettempdir()) / "testflow-generated-tests"
+TEMP_TEST_DIR.mkdir(parents=True, exist_ok=True)
 
-# MongoDB connection
+# MongoDB connection with proper SSL/TLS configuration
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
+
+# Only enforce TLS defaults for Atlas/SRV URLs.
+# Plain localhost MongoDB setups usually run without TLS in development.
+mongo_client_options = {
+    "serverSelectionTimeoutMS": 10000,
+    "connectTimeoutMS": 10000,
+    "socketTimeoutMS": 10000,
+}
+
+if mongo_url.startswith("mongodb+srv://"):
+    mongo_client_options.update(
+        {
+            "retryWrites": True,
+            "tls": True,
+            "tlsAllowInvalidCertificates": False,
+            "tlsCAFile": certifi.where(),
+        }
+    )
+
+client = AsyncIOMotorClient(mongo_url, **mongo_client_options)
 db = client[os.environ['DB_NAME']]
 
 # SQLite for test storage
@@ -487,19 +511,19 @@ async def execute_test(result_id: str, test: dict, user_id: str):
     step_results = []
     
     started = datetime.now(timezone.utc)
+    script_path = TEMP_TEST_DIR / f"temp_test_{result_id}.py"
     
     try:
         # Generate Playwright script
         script = generate_playwright_script(steps, test.get("browser", "chromium"))
         
         # Write script to temp file
-        script_path = ROOT_DIR / f"temp_test_{result_id}.py"
         with open(script_path, "w") as f:
             f.write(script)
         
         # Run the script
         process = subprocess.run(
-            ["python", str(script_path)],
+            [sys.executable, str(script_path)],
             capture_output=True,
             text=True,
             timeout=300,
@@ -524,16 +548,15 @@ async def execute_test(result_id: str, test: dict, user_id: str):
                     step_results.append({"step": i, "status": "failed", "description": step.get("description", f"Step {i+1}"), "error": error_message})
                     break
         
-        # Clean up
-        if script_path.exists():
-            script_path.unlink()
-            
     except subprocess.TimeoutExpired:
         status = "failed"
         error_message = "Test execution timed out (5 minutes)"
     except Exception as e:
         status = "failed"
         error_message = str(e)
+    finally:
+        if script_path.exists():
+            script_path.unlink()
     
     completed = datetime.now(timezone.utc)
     duration_ms = int((completed - started).total_seconds() * 1000)
@@ -1038,21 +1061,28 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     await init_sqlite()
-    await db.users.create_index("email", unique=True)
     
-    # Seed admin user
+    # Set admin credentials
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@testflow.com")
     admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing = await db.users.find_one({"email": admin_email})
-    if not existing:
-        await db.users.insert_one({
-            "email": admin_email,
-            "password_hash": hash_password(admin_password),
-            "name": "Admin",
-            "role": "admin",
-            "created_at": datetime.now(timezone.utc).isoformat()
-        })
-        logger.info(f"Admin user created: {admin_email}")
+    
+    try:
+        await db.users.create_index("email", unique=True)
+        
+        # Seed admin user
+        existing = await db.users.find_one({"email": admin_email})
+        if not existing:
+            await db.users.insert_one({
+                "email": admin_email,
+                "password_hash": hash_password(admin_password),
+                "name": "Admin",
+                "role": "admin",
+                "created_at": datetime.now(timezone.utc).isoformat()
+            })
+            logger.info(f"Admin user created: {admin_email}")
+    except Exception as e:
+        logger.warning(f"MongoDB operations failed during startup: {str(e)}")
+        logger.info("Server starting without database. Database operations may fail until MongoDB is available.")
     
     # Write test credentials
     memory_dir = ROOT_DIR.parent / "memory"  # Use local memory directory

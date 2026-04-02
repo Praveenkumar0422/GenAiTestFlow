@@ -1,5 +1,6 @@
 # Define paths
 $projectRoot = "c:\Users\Admin\Downloads\GenAiTestFlow\app-main"
+$pythonExe = "c:\Users\Admin\Downloads\GenAiTestFlow\.venv\Scripts\python.exe"
 
 Write-Host "================================" -ForegroundColor Green
 Write-Host "Starting TestFlow Application..." -ForegroundColor Green
@@ -17,7 +18,12 @@ if (-not (Test-Path "$projectRoot\.env")) {
 
 # Start Backend Server
 Write-Host "Starting Backend Server on port 8000..." -ForegroundColor Yellow
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$projectRoot\backend'; python -m uvicorn server:app --reload --host 0.0.0.0 --port 8000"
+if (-not (Test-Path $pythonExe)) {
+    Write-Host "ERROR: Python virtualenv not found at $pythonExe" -ForegroundColor Red
+    exit 1
+}
+
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$projectRoot\backend'; & '$pythonExe' -m uvicorn server:app --reload --reload-exclude 'temp_test_*.py' --host 0.0.0.0 --port 8000"
 
 # Wait for backend to start
 Start-Sleep -Seconds 4
